@@ -3,9 +3,10 @@ One off unittests
 """
 import os
 import sys
+import threading
 import unittest
 
-from collections import defaultdict
+from collections import defaultdict, namedtuple
 from intervaltree import IntervalTree
 
 # Use the current truvari, not any installed libraries
@@ -160,6 +161,53 @@ class TestPhab(unittest.TestCase):
         job = phab.PhabJob("fake", mem_vcf_info)
         self.assertTrue(phab.status_marker(1, {}, "", job) == "ERROR: 'str' object is not callable", "PhabJob")
         phab.cleanup_shared_memory(shared_info)
+
+
+FakePoolJob = namedtuple("FakePoolJob", "name")
+
+
+def _job_that_may_die(job):
+    """
+    Return the job's name, except for the one job that vanishes without returning.
+
+    `os._exit` skips cleanup and sends nothing back to the parent, which is what the pool
+    sees when the OOM killer takes a worker mid-task.
+    """
+    if job.name == "dies":
+        os._exit(1)
+    return job.name + "\n"
+
+
+class TestMonitoredPool(unittest.TestCase):
+    def test_survives_dead_worker(self):
+        """
+        A worker that dies without returning must not stall the remaining jobs.
+
+        `Pool.imap_unordered` waits on its result queue forever here: the task the dead
+        worker held is simply lost, the pool quietly replaces the worker, and the parent
+        blocks with no error and no output. `monitored_pool` instead notices the pid is
+        gone, gives up on that job after MAXFAIL polls, and keeps going -- so this test
+        fails by TIMING OUT if the monitoring is ever dropped.
+        """
+        jobs = [FakePoolJob(n) for n in ("a", "dies", "b", "c")]
+        collected = []
+        finished = threading.Event()
+
+        def consume():
+            try:
+                for result in phab.monitored_pool(_job_that_may_die, jobs, 2):
+                    collected.append(result)
+            finally:
+                finished.set()
+
+        worker = threading.Thread(target=consume, daemon=True)
+        worker.start()
+        # monitored_pool polls once a second and needs MAXFAIL polls to write a job off,
+        # so this resolves in well under ten seconds when the monitoring is in place.
+        self.assertTrue(finished.wait(120),
+                        "monitored_pool did not return after a worker died")
+        self.assertEqual(sorted(collected), ["a\n", "b\n", "c\n"],
+                         "every surviving job should still be yielded")
 
 
 class FakeVCFI():

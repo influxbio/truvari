@@ -67,7 +67,7 @@ Data:
 """
 # pylint: disable=undefined-all-variable
 
-__version__ = '5.4.0'
+__version__ = '5.4.1+influx'
 
 __all__ = [
     # Classes
