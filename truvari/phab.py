@@ -393,7 +393,7 @@ def is_process_alive(pid):  # pragma: no cover
         return False  # Process was removed or is inaccessible
 
 
-def monitored_pool(method, jobs, threads):
+def monitored_pool(method, jobs, threads, maxtasksperchild=100):
     """
     Create a pool of workers, send them the method/jobs, monitor the results for yielding
     """
@@ -403,7 +403,7 @@ def monitored_pool(method, jobs, threads):
     n_failed = 0
     prev_completed = 0.05
 
-    with multiprocessing.Pool(threads, maxtasksperchild=100) as pool, multiprocessing.Manager() as manager:
+    with multiprocessing.Pool(threads, maxtasksperchild=maxtasksperchild) as pool, multiprocessing.Manager() as manager:
         pid_dict = manager.dict({_: 0 for _ in range(len(jobs))})
 
         results = [pool.apply_async(status_marker, (jid, pid_dict, method, job,))
@@ -550,13 +550,14 @@ def run_phab(vcf_info, regions, output_fn, buffer=100,
         fout.write("#CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO\tFORMAT\t")
         fout.write("\t".join(vcf_info.out_samples) + '\n')
 
-        if in_mem:
-            with multiprocessing.Pool(threads, maxtasksperchild=1000) as pool:
-                for result in pool.imap_unordered(to_call, jobs):
-                    fout.write(result)
-        else:
-            for entry_set in monitored_pool(to_call, jobs, threads):
-                fout.write(entry_set)
+        # Both paths are monitored. `Pool.imap_unordered` waits on its result queue forever if a
+        # worker dies without returning -- the task is simply lost and the parent blocks with no
+        # error. That is reachable in practice: a single locus whose haplotypes are long enough can
+        # push abPOA past the machine's memory, the OOM killer takes the worker, `Pool` silently
+        # replaces it, and phab hangs until something external kills it.
+        for entry_set in monitored_pool(to_call, jobs, threads,
+                                        maxtasksperchild=1000 if in_mem else 100):
+            fout.write(entry_set)
 
     truvari.compress_index_vcf(output_fn[:-len(".gz")], output_fn)
 
