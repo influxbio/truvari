@@ -7,12 +7,16 @@ import threading
 import unittest
 
 from collections import defaultdict, namedtuple
+from unittest.mock import patch
+
+import pandas as pd
 from intervaltree import IntervalTree
 
 # Use the current truvari, not any installed libraries
 sys.path.insert(0, os.getcwd())
 import truvari
 from truvari import phab
+from truvari import refine as refine_mod
 from truvari.region_vcf_iter import region_filter_stream, region_filter_fetch
 
 # Assume we're running in truvari root directory
@@ -208,6 +212,73 @@ class TestMonitoredPool(unittest.TestCase):
                         "monitored_pool did not return after a worker died")
         self.assertEqual(sorted(collected), ["a\n", "b\n", "c\n"],
                          "every surviving job should still be yielded")
+
+
+class TestRefinedStratify(unittest.TestCase):
+    """
+    A region phab could not harmonize must keep its unrefined counts
+    """
+
+    @staticmethod
+    def _regions():
+        return pd.DataFrame({
+            "chrom": ["chr1", "chr1", "chr2"],
+            "start": [100, 500, 100],
+            "end": [200, 600, 200],
+            "in_tpbase": [1, 3, 5],
+            "in_tp": [1, 3, 5],
+            "in_fn": [2, 4, 6],
+            "in_fp": [2, 4, 6],
+            "refined": [True, True, False],
+        })
+
+    @staticmethod
+    def _zero_counts(*_args, **_kwargs):
+        """Stand in for the counter: phab emitted nothing for either refined region."""
+        return pd.DataFrame({"tpbase": [0, 0], "tp": [0, 0], "fn": [0, 0], "fp": [0, 0]})
+
+    def test_failed_region_keeps_unrefined_counts(self):
+        """
+        The failed region's variants must stay in the comparison.
+
+        Counting it as refined-with-zero-variants drops them from the denominator, which
+        inflates recall -- silently, because an empty region and a failed one look identical
+        in phab's output.
+        """
+        coords = [["chr1", 100, 200], ["chr1", 500, 600]]
+        with patch("truvari.benchdir_count_entries", self._zero_counts):
+            got = refine_mod.refined_stratify(
+                "unused", coords, self._regions(), 1,
+                failed_regions=["chr1:100-200"])
+
+        failed = got.iloc[0]
+        self.assertFalse(failed["refined"], "a failed region is not a refined region")
+        for col in ("tpbase", "tp", "fn", "fp"):
+            self.assertEqual(failed[f"out_{col}"], failed[f"in_{col}"],
+                             f"failed region lost its {col}")
+
+        # The region phab did handle still takes phab's counts, zeros included.
+        self.assertTrue(got.iloc[1]["refined"])
+        self.assertEqual(got.iloc[1]["out_fn"], 0)
+
+    def test_no_failures_is_unchanged(self):
+        """Without failures the counts come from phab, as before."""
+        coords = [["chr1", 100, 200], ["chr1", 500, 600]]
+        with patch("truvari.benchdir_count_entries", self._zero_counts):
+            got = refine_mod.refined_stratify("unused", coords, self._regions(), 1)
+        self.assertEqual(list(got["refined"]), [True, True, False])
+        self.assertEqual(list(got["out_fn"]), [0, 0, 6])
+
+    def test_merged_name_demotes_every_row_it_covers(self):
+        """phab merges overlapping intervals before naming them, so one name can span rows."""
+        regions = self._regions()
+        mask = refine_mod.unrefinable_mask(regions, ["chr1:150-550"])
+        self.assertEqual(list(mask), [True, True, False])
+
+    def test_mask_is_chromosome_aware(self):
+        regions = self._regions()
+        mask = refine_mod.unrefinable_mask(regions, ["chr2:100-200"])
+        self.assertEqual(list(mask), [False, False, True])
 
 
 class FakeVCFI():

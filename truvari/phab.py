@@ -395,9 +395,13 @@ def is_process_alive(pid):  # pragma: no cover
         return False  # Process was removed or is inaccessible
 
 
-def monitored_pool(method, jobs, threads, maxtasksperchild=100):
+def monitored_pool(method, jobs, threads, maxtasksperchild=100, failures=None):
     """
     Create a pool of workers, send them the method/jobs, monitor the results for yielding
+
+    Names of jobs that produced no result are appended to `failures` when it is given. A caller
+    that ignores them cannot tell a job that failed from a job whose region held no variants,
+    because both simply contribute nothing to the output.
     """
     # Allow jobs to fail upto 5 times
     MAXFAIL = 5
@@ -427,6 +431,8 @@ def monitored_pool(method, jobs, threads, maxtasksperchild=100):
 
                     if isinstance(output, str) and output.startswith("ERROR:"):
                         n_failed += 1
+                        if failures is not None:
+                            failures.append(jobs[job_id].name)
                         logging.error(f"{jobs[job_id].name} {output}")
                     else:
                         n_completed += 1
@@ -438,6 +444,8 @@ def monitored_pool(method, jobs, threads, maxtasksperchild=100):
                     if fail_count[job_id] >= MAXFAIL:
                         logging.error(f"{jobs[job_id].name} ERROR: Failed")
                         n_failed += 1
+                        if failures is not None:
+                            failures.append(jobs[job_id].name)
                         pid_dict[job_id] = -2
 
             # Manual progress bars
@@ -541,6 +549,9 @@ def run_phab(vcf_info, regions, output_fn, buffer=100,
         jobs = [PhabJob(name, mem_vcf_info) for name in m_refs]
 
     logging.info("Harmonizing variants")
+    # Regions phab could not harmonize. Returned so callers can tell them apart from regions that
+    # harmonized to nothing -- they are indistinguishable in the output VCF.
+    failures = []
     to_call = functools.partial(align_wrap,
                                 func=align_method,
                                 dedup=dedup)
@@ -558,10 +569,12 @@ def run_phab(vcf_info, regions, output_fn, buffer=100,
         # push abPOA past the machine's memory, the OOM killer takes the worker, `Pool` silently
         # replaces it, and phab hangs until something external kills it.
         for entry_set in monitored_pool(to_call, jobs, threads,
-                                        maxtasksperchild=1000 if in_mem else 100):
+                                        maxtasksperchild=1000 if in_mem else 100,
+                                        failures=failures):
             fout.write(entry_set)
 
     truvari.compress_index_vcf(output_fn[:-len(".gz")], output_fn)
+    return failures
 
 
 ######
