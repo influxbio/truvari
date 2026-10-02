@@ -12,7 +12,7 @@ import logging
 import argparse
 import functools
 from io import StringIO
-from collections import defaultdict, Counter
+from collections import defaultdict
 import multiprocessing
 import multiprocessing.shared_memory as shm
 
@@ -403,8 +403,16 @@ def monitored_pool(method, jobs, threads, maxtasksperchild=100, failures=None):
     that ignores them cannot tell a job that failed from a job whose region held no variants,
     because both simply contribute nothing to the output.
     """
-    # Allow jobs to fail upto 5 times
-    MAXFAIL = 5
+    # How long a job's worker must be gone before the job is written off. A WINDOW, not a poll
+    # count: the interval below is adaptive, so counting polls would make the write-off delay
+    # depend on how fast the loop happens to be spinning. Generous, because a worker being
+    # recycled at `maxtasksperchild` is briefly indistinguishable from one that died.
+    FAIL_AFTER = 5
+    # Start responsive and back off towards a second. A fixed 1 s tick put a floor of several
+    # seconds on every call, which is nothing next to a long refine but dominates phab on a small
+    # VCF -- 2.1 s of polling over 0.3 s of work for ~120 loci. The polling is not the expense:
+    # proxying the whole status dict costs 1.2 ms per tick at ~3.8k jobs.
+    poll = 0.05
     n_completed = 0
     n_failed = 0
     prev_completed = 0.05
@@ -414,9 +422,13 @@ def monitored_pool(method, jobs, threads, maxtasksperchild=100, failures=None):
 
         results = [pool.apply_async(status_marker, (jid, pid_dict, method, job,))
                    for jid, job in enumerate(jobs)]
-        fail_count = Counter()
-        time.sleep(1)
-        while any(v != -2 for v in pid_dict.values()):
+        # When each job's worker was first seen missing. Jobs that have not registered a pid yet
+        # are skipped below, so nothing here fires before a job has actually started.
+        first_missing = {}
+        # Counting locally rather than asking the manager whether everything is done: the counts
+        # below already track it exactly, since a job is marked -2 precisely when it is counted.
+        # That halves the dict proxying to one call per tick.
+        while n_completed + n_failed < len(jobs):
             for job_id, pid in pid_dict.items():
                 # Not started or already handled
                 if pid in (0, -2):
@@ -440,13 +452,16 @@ def monitored_pool(method, jobs, threads, maxtasksperchild=100, failures=None):
                     # Mark as completed
                     pid_dict[job_id] = -2
                 elif not is_process_alive(pid):
-                    fail_count[job_id] += 1
-                    if fail_count[job_id] >= MAXFAIL:
+                    first_missing.setdefault(job_id, time.time())
+                    if time.time() - first_missing[job_id] >= FAIL_AFTER:
                         logging.error(f"{jobs[job_id].name} ERROR: Failed")
                         n_failed += 1
                         if failures is not None:
                             failures.append(jobs[job_id].name)
                         pid_dict[job_id] = -2
+                else:
+                    # Alive again -- it was being recycled, not dying.
+                    first_missing.pop(job_id, None)
 
             # Manual progress bars
             pct_completed = (n_completed + n_failed) / len(jobs)
@@ -456,7 +471,8 @@ def monitored_pool(method, jobs, threads, maxtasksperchild=100, failures=None):
                              pct_completed * 100, n_failed)
                 prev_completed = min(1, pct_completed + 0.05)
             # Don't thrash the manager
-            time.sleep(1)
+            time.sleep(poll)
+            poll = min(1.0, poll * 1.5)
     # Close up progress
     if (n_completed + n_failed) / len(jobs) != prev_completed:
         logging.info("Completed %d / %d (%d%%) Loci; %d Failed",
