@@ -3,9 +3,12 @@ One off unittests
 """
 import os
 import sys
+import threading
 import unittest
 
-from collections import defaultdict
+from collections import defaultdict, namedtuple
+from unittest.mock import patch
+
 from intervaltree import IntervalTree
 
 # Use the current truvari, not any installed libraries
@@ -160,6 +163,66 @@ class TestPhab(unittest.TestCase):
         job = phab.PhabJob("fake", mem_vcf_info)
         self.assertTrue(phab.status_marker(1, {}, "", job) == "ERROR: 'str' object is not callable", "PhabJob")
         phab.cleanup_shared_memory(shared_info)
+
+
+FakePoolJob = namedtuple("FakePoolJob", "name")
+
+
+def _job_that_may_die(job):
+    """
+    Return the job's name, except "dies", which exits like an OOM-killed worker
+    """
+    if job.name == "dies":
+        os._exit(1)
+    return job.name + "\n"
+
+
+def _job_that_raises(job):
+    """
+    Return the job's name, except "raises", which raises like a failing aligner
+    """
+    if job.name == "raises":
+        raise ValueError("aligner failed")
+    return job.name + "\n"
+
+
+class TestMonitoredPool(unittest.TestCase):
+    def test_survives_dead_worker(self):
+        """
+        A worker dying mid-task must not stall the other jobs. Without monitoring this hangs,
+        so the test fails by timing out
+        """
+        jobs = [FakePoolJob(n) for n in ("a", "dies", "b", "c")]
+        collected = []
+        failures = []
+        finished = threading.Event()
+
+        def consume():
+            try:
+                for result in phab.monitored_pool(_job_that_may_die, jobs, 2, failures=failures):
+                    collected.append(result)
+            finally:
+                finished.set()
+
+        # A 1 s window instead of 5 keeps the test quick
+        with patch.object(phab, "MONITOR_FAIL_AFTER", 1):
+            worker = threading.Thread(target=consume, daemon=True)
+            worker.start()
+            self.assertTrue(finished.wait(120),
+                            "monitored_pool did not return after a worker died")
+        self.assertEqual(sorted(collected), ["a\n", "b\n", "c\n"],
+                         "every surviving job should still be yielded")
+        self.assertEqual(failures, ["dies"],
+                         "the lost job should be reported as failed")
+
+    def test_reports_raising_job(self):
+        """A job that raises is reported in failures, and the others still yield"""
+        jobs = [FakePoolJob(n) for n in ("a", "raises", "b")]
+        failures = []
+        got = sorted(phab.monitored_pool(_job_that_raises, jobs, 2,
+                                         failures=failures))
+        self.assertEqual(got, ["a\n", "b\n"])
+        self.assertEqual(failures, ["raises"])
 
 
 class FakeVCFI():

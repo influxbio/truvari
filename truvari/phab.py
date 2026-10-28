@@ -12,10 +12,11 @@ import logging
 import argparse
 import functools
 from io import StringIO
-from collections import defaultdict, Counter
+from collections import defaultdict
 import multiprocessing
 import multiprocessing.shared_memory as shm
 
+import numpy as np
 import pysam
 import psutil
 import pyabpoa
@@ -395,17 +396,37 @@ class VCFtoHaplotypes():
 ##################
 
 
-def status_marker(job_id, pid_dict, func, job):
+def status_marker(job_id, status, func, job):
     """
     Before running the function set a status
     """
-    pid_dict[job_id] = os.getpid()  # Register PID
+    status[job_id] = os.getpid()  # Register PID
     try:
         ret = func(job)
     except Exception as e:  # pylint: disable=broad-exception-caught pragma: no cover
         ret = f"ERROR: {e}"
-    pid_dict[job_id] = -1  # Mark as finished
+    status[job_id] = -1  # Mark as finished
     return ret
+
+
+# Set in each worker by the pool initializer: a shared array can't be a task argument
+_STATUS = None
+
+
+def _init_status(status):
+    """
+    Pool initializer: keep the shared status array
+    """
+    global _STATUS  # pylint: disable=global-statement
+    _STATUS = status
+
+
+def _marked(item, func):
+    """
+    status_marker on the shared status array. Returns the job id with the result
+    """
+    job_id, job = item
+    return job_id, status_marker(job_id, _STATUS, func, job)
 
 
 def is_process_alive(pid):  # pragma: no cover
@@ -419,50 +440,63 @@ def is_process_alive(pid):  # pragma: no cover
         return False  # Process was removed or is inaccessible
 
 
-def monitored_pool(method, jobs, threads):
+# Seconds a job's worker must stay missing before monitored_pool fails the job
+MONITOR_FAIL_AFTER = 5
+
+
+def monitored_pool(method, jobs, threads, maxtasksperchild=100, failures=None):
     """
     Create a pool of workers, send them the method/jobs, monitor the results for yielding
+
+    Names of jobs that fail are appended to `failures`, if given
     """
-    # Allow jobs to fail upto 5 times
-    MAXFAIL = 5
+    POLL = 0.1
+    if failures is None:
+        failures = []
     n_completed = 0
     n_failed = 0
     prev_completed = 0.05
 
-    with multiprocessing.Pool(threads, maxtasksperchild=100) as pool, multiprocessing.Manager() as manager:
-        pid_dict = manager.dict({_: 0 for _ in range(len(jobs))})
+    # Per job: 0 not started, the worker's pid while running, -1 finished, -2 failed
+    status = multiprocessing.RawArray('l', len(jobs))
+    view = np.ctypeslib.as_array(status)
+    first_missing = {}
+    next_check = time.time() + POLL
+    with multiprocessing.Pool(threads, maxtasksperchild=maxtasksperchild,
+                              initializer=_init_status, initargs=(status,)) as pool:
+        marked = functools.partial(_marked, func=method)
+        results = pool.imap_unordered(marked, enumerate(jobs))
+        while n_completed + n_failed < len(jobs):
+            try:
+                job_id, output = results.next(timeout=POLL)
+            except multiprocessing.TimeoutError:
+                pass
+            else:
+                if isinstance(output, str) and output.startswith("ERROR:"):
+                    n_failed += 1
+                    failures.append(jobs[job_id].name)
+                    logging.error(f"{jobs[job_id].name} {output}")
+                else:
+                    n_completed += 1
+                    yield output
 
-        results = [pool.apply_async(status_marker, (jid, pid_dict, method, job,))
-                   for jid, job in enumerate(jobs)]
-        fail_count = Counter()
-        time.sleep(1)
-        while any(v != -2 for v in pid_dict.values()):
-            for job_id, pid in pid_dict.items():
-                # Not started or already handled
-                if pid in (0, -2):
-                    continue
-
-                # Either finished or failed
-                if pid == -1:
-                    try:
-                        output = results[job_id].get()
-                    except Exception as e:  # pylint: disable=broad-exception-caught
-                        output = f"ERROR: {e}"
-
-                    if isinstance(output, str) and output.startswith("ERROR:"):
-                        n_failed += 1
-                        logging.error(f"{jobs[job_id].name} {output}")
+            # A job whose worker died never returns, so check the running jobs' workers
+            if time.time() >= next_check:
+                next_check = time.time() + POLL
+                for job_id in np.flatnonzero(view > 0).tolist():
+                    pid = status[job_id]
+                    if pid <= 0:  # Finished since the scan
+                        continue
+                    if is_process_alive(pid):
+                        # Alive, so an earlier miss was a misread
+                        first_missing.pop(job_id, None)
                     else:
-                        n_completed += 1
-                        yield output
-                    # Mark as completed
-                    pid_dict[job_id] = -2
-                elif not is_process_alive(pid):
-                    fail_count[job_id] += 1
-                    if fail_count[job_id] >= MAXFAIL:
-                        logging.error(f"{jobs[job_id].name} ERROR: Failed")
-                        n_failed += 1
-                        pid_dict[job_id] = -2
+                        first_missing.setdefault(job_id, time.time())
+                        if time.time() - first_missing[job_id] >= MONITOR_FAIL_AFTER:
+                            logging.error(f"{jobs[job_id].name} ERROR: Failed")
+                            n_failed += 1
+                            failures.append(jobs[job_id].name)
+                            status[job_id] = -2
 
             # Manual progress bars
             pct_completed = (n_completed + n_failed) / len(jobs)
@@ -471,8 +505,6 @@ def monitored_pool(method, jobs, threads):
                              n_completed, len(jobs),
                              pct_completed * 100, n_failed)
                 prev_completed = min(1, pct_completed + 0.05)
-            # Don't thrash the manager
-            time.sleep(1)
     # Close up progress
     if (n_completed + n_failed) / len(jobs) != prev_completed:
         logging.info("Completed %d / %d (%d%%) Loci; %d Failed",
