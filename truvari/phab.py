@@ -575,6 +575,9 @@ def run_phab(vcf_info, regions, output_fn, buffer=100,
     :type `method`: function
     :param `threads`: Number of threads to use
     :type `threads`: :class:`int`
+
+    :return: Names of regions that failed to harmonize. Their variants are not in the output
+    :rtype: :class:`list`
     """
     logging.info("Preparing reference/regions")
     vcf_info.set_regions(regions, buffer)
@@ -597,6 +600,8 @@ def run_phab(vcf_info, regions, output_fn, buffer=100,
         jobs = [PhabJob(name, mem_vcf_info) for name in m_refs]
 
     logging.info("Harmonizing variants")
+    # Failed regions look the same as empty ones in the output, so they're returned
+    failures = []
     to_call = functools.partial(align_wrap,
                                 func=align_method,
                                 dedup=dedup)
@@ -608,15 +613,14 @@ def run_phab(vcf_info, regions, output_fn, buffer=100,
         fout.write("#CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO\tFORMAT\t")
         fout.write("\t".join(vcf_info.out_samples) + '\n')
 
-        if in_mem:
-            with multiprocessing.Pool(threads, maxtasksperchild=1000) as pool:
-                for result in pool.imap_unordered(to_call, jobs):
-                    fout.write(result)
-        else:
-            for entry_set in monitored_pool(to_call, jobs, threads):
-                fout.write(entry_set)
+        # Monitored on both paths: a plain Pool hangs if a worker dies mid-task
+        for entry_set in monitored_pool(to_call, jobs, threads,
+                                        maxtasksperchild=1000 if in_mem else 100,
+                                        failures=failures):
+            fout.write(entry_set)
 
     truvari.compress_index_vcf(output_fn[:-len(".gz")], output_fn)
+    return failures
 
 
 ######
@@ -775,11 +779,14 @@ def phab_main(cmdargs):
     all_regions = parse_regions(args.region)
     method = get_align_method(args.align, args.mafft_params)
 
-    run_phab(m_vcf_info, all_regions, args.output,
-             buffer=args.buffer,
-             align_method=method,
-             dedup=args.no_dedup,
-             in_mem=args.lowmem,
-             threads=args.threads)
+    failures = run_phab(m_vcf_info, all_regions, args.output,
+                        buffer=args.buffer,
+                        align_method=method,
+                        dedup=args.no_dedup,
+                        in_mem=args.lowmem,
+                        threads=args.threads)
+    if failures:
+        logging.warning("phab failed on %d region(s); their variants are not in %s",
+                        len(failures), args.output)
 
     logging.info("Finished phab")
